@@ -1,0 +1,33 @@
+# 加载 STM32F103 平台
+using sysbus
+mach create "stm32f103"
+machine LoadPlatformDescription @platforms/cpus/stm32f103.repl
+
+# 创建 GDB 服务器（默认端口 1234）
+machine StartGdbServer 3333
+
+# 加载你的固件（.elf 或 .bin）
+sysbus LoadELF @/home/shd/github/FOC/output/stm32f103c8t6.elf
+
+# 或者加载 bin 文件到指定地址
+# sysbus LoadBinary @/path/to/your/firmware.bin 0x08000000
+
+# 设置 PC 到复位向量
+cpu PC 0x08000000
+
+# 可选：添加日志观察点
+# logLevel 3
+
+
+
+# 打开分析器窗口
+# showAnalyzer sysbus.gpioa
+
+
+# 可选：记录 GPIO 访问
+# logPeripheralAccess sysbus.gpioa
+
+# GDB 调试
+# machine StartGdbServer 3333
+
+start

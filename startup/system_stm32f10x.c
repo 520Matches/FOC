@@ -1068,8 +1068,12 @@ static void SetSysClockTo72(void)
     RCC->CFGR |= (uint32_t)RCC_CFGR_SW_PLL;    
 
     /* Wait till PLL is used as system clock source */
-    while ((RCC->CFGR & (uint32_t)RCC_CFGR_SWS) != (uint32_t)0x08)
-    {
+    // while ((RCC->CFGR & (uint32_t)RCC_CFGR_SWS) != (uint32_t)0x08)
+    // {
+    // }
+    StartUpCounter = 0;
+    while(((RCC->CFGR & RCC_CFGR_SWS) != (uint32_t)0x08) && (StartUpCounter < 0x1000)) {
+      StartUpCounter++;
     }
   }
   else

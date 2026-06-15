@@ -9,15 +9,13 @@ TARGET = stm32f103c8t6
 CPU = cortex-m3
 
 # 编译选项
-CFLAGS = -mcpu=$(CPU) -mthumb -nostartfiles -Wall -g -O2
+CFLAGS = -mcpu=$(CPU) -mthumb -nostartfiles -Wall -g -O0
 CFLAGS += -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER -Iinclude -Istartup -Icore -Idrivers/inc 
 LDFLAGS = -Tlinker.ld -Wl,-Map=output/$(TARGET).map
 LIBS = -lc -lm -lnosys
 
 # 源文件和目标文件
 SRCS = $(wildcard drivers/src/*.c) \
-	   $(wildcard peripherals/systick/*.c) \
-	   $(wildcard peripherals/timer/*.c) \
 		startup/system_stm32f10x.c \
 		startup/stm32f10x_it.c \
 		core/core_cm3.c	\
@@ -69,9 +67,15 @@ clean:
 flash: $(BIN)
 	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg -c "program ./output/stm32f103c8t6.hex verify reset exit"
 
+erase:
+	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg -c "init" -c "halt" -c "stm32f1x mass_erase 0" -c "exit"
+
+readbin:
+	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg -c "init" -c "halt" -c "flash read_bank 0 read_flash.bin 0 0x10000" -c "exit"
+
 # 调试
 debug:
 	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg
 
 gdb:
-	arm-none-eabi-gdb ./output/stm32f103c8t6.elf -ex "target remote localhost:3333"
+	arm-none-eabi-gdb ./output/stm32f103c8t6.elf -ex "target remote localhost:3333" -ex "monitor reset halt"
