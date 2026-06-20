@@ -1,155 +1,153 @@
 #include "stm32f10x.h"
+#include <stdio.h>
+#include "uart.h"      /* uart_init, printf→USART2 */
+#include "motor.h"     /* motor_init/start/stop    */
+#include "drv8313.h"   /* drv8313_set_phase 等     */
+#include "mt6701.h"    /* mt6701_read_angle_raw    */
+#include "ina199.h"    /* ina199_read_u_raw        */
 
-#define PWM_PERIOD  1000   // ARR
-#define PWM_PULSE   500    // 50% 占空比（示例）
+/* ==================================================================
+ * 驱动测试 + 串口日志 (ST-Link V2 或 USB-TTL)
+ *
+ * 接线: ST-Link TX→PA3(RX), ST-Link RX→PA2(TX), GND→GND
+ * 串口工具: 115200-8-N-1
+ *
+ * 注: 为避免 Flash 溢出, 浮点数拆为整数+小数打印
+ *     例如 271.3° 打印为 "271.3"
+ * ================================================================== */
 
-/* DMA 缓冲区 */
-#define ADC_CH_NUM  2
-uint16_t adc_buf[ADC_CH_NUM];
-
-void pwm_init(void)
+/* ---- 定点数打印: 角度 (1位小数) ---- */
+static void print_angle(float deg)
 {
-    GPIO_InitTypeDef GPIO_InitStructure;
-    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
-    TIM_OCInitTypeDef TIM_OCStructure;
-
-    RCC_APB2PeriphClockCmd(
-        RCC_APB2Periph_TIM1 |
-        RCC_APB2Periph_GPIOA,
-        ENABLE
-    );
-
-    /* PA8 / PA9 / PA10 : AF_PP */
-    GPIO_InitStructure.GPIO_Pin =
-        GPIO_Pin_8 | GPIO_Pin_9 | GPIO_Pin_10;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOA, &GPIO_InitStructure);
-
-    /* 时基 */
-    TIM_TimeBaseStructure.TIM_Period = PWM_PERIOD;
-    TIM_TimeBaseStructure.TIM_Prescaler = 0;
-    TIM_TimeBaseStructure.TIM_ClockDivision = 0;
-    TIM_TimeBaseStructure.TIM_CounterMode =
-        TIM_CounterMode_CenterAligned1;
-    TIM_TimeBaseStructure.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
-
-    /* PWM 通道 */
-    TIM_OCStructure.TIM_OCMode = TIM_OCMode_PWM1;
-    TIM_OCStructure.TIM_OutputState = TIM_OutputState_Enable;
-    TIM_OCStructure.TIM_OutputNState = TIM_OutputNState_Disable;
-    TIM_OCStructure.TIM_Pulse = PWM_PERIOD / 2;
-    TIM_OCStructure.TIM_OCPolarity = TIM_OCPolarity_High;
-    TIM_OCStructure.TIM_OCNPolarity = TIM_OCNPolarity_High;
-    TIM_OCStructure.TIM_OCIdleState = TIM_OCIdleState_Reset;
-    TIM_OCStructure.TIM_OCNIdleState = TIM_OCNIdleState_Reset;
-
-    TIM_OC1Init(TIM1, &TIM_OCStructure);
-    TIM_OC2Init(TIM1, &TIM_OCStructure);
-    TIM_OC3Init(TIM1, &TIM_OCStructure);
-
-    /* CC1 用作 ADC 触发 */
-    TIM_OC1PreloadConfig(TIM1, TIM_OCPreload_Enable);
-
-    TIM_Cmd(TIM1, ENABLE);
-    TIM_CtrlPWMOutputs(TIM1, ENABLE);
+    int a = (int)deg;
+    int f = (int)((deg - (float)a) * 10.0f + 0.5f);
+    printf("%d.%d", a, f);
 }
 
-void adc_init(void)
+/* ---- 定点数打印: 电流 (2位小数, 单位 A) ---- */
+static void print_amps(float a)
 {
-	ADC_InitTypeDef ADC_InitStructure;
-    GPIO_InitTypeDef GPIO_InitStructure;
-    DMA_InitTypeDef DMA_InitStructure;
-
-    /* 1. 开时钟 */
-    RCC_APB2PeriphClockCmd(
-        RCC_APB2Periph_ADC1 |
-        RCC_APB2Periph_GPIOA,
-        ENABLE
-    );
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
-
-    /* 2. PA0 / PA1：模拟输入 */
-    GPIO_InitStructure.GPIO_Pin =
-        GPIO_Pin_0 | GPIO_Pin_1;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
-    GPIO_Init(GPIOA, &GPIO_InitStructure);
-
-    /* 3. DMA 配置 */
-    DMA_DeInit(DMA1_Channel1);
-
-    DMA_InitStructure.DMA_PeripheralBaseAddr =
-        (uint32_t)&ADC1->DR;
-    DMA_InitStructure.DMA_MemoryBaseAddr =
-        (uint32_t)adc_buf;
-    DMA_InitStructure.DMA_DIR =
-        DMA_DIR_PeripheralSRC;
-    DMA_InitStructure.DMA_BufferSize =
-        ADC_CH_NUM;
-    DMA_InitStructure.DMA_PeripheralInc =
-        DMA_PeripheralInc_Disable;
-    DMA_InitStructure.DMA_MemoryInc =
-        DMA_MemoryInc_Enable;
-    DMA_InitStructure.DMA_PeripheralDataSize =
-        DMA_PeripheralDataSize_HalfWord;
-    DMA_InitStructure.DMA_MemoryDataSize =
-        DMA_MemoryDataSize_HalfWord;
-    DMA_InitStructure.DMA_Mode =
-        DMA_Mode_Circular;      // ✅ 循环模式
-    DMA_InitStructure.DMA_Priority =
-        DMA_Priority_High;
-    DMA_InitStructure.DMA_M2M =
-        DMA_M2M_Disable;
-    DMA_Init(DMA1_Channel1, &DMA_InitStructure);
-
-    DMA_Cmd(DMA1_Channel1, ENABLE);
-
-    /* 4. ADC 配置 */
-    ADC_DeInit(ADC1);
-
-    ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;
-    ADC_InitStructure.ADC_ScanConvMode = ENABLE;
-    ADC_InitStructure.ADC_ContinuousConvMode = DISABLE;
-    ADC_InitStructure.ADC_ExternalTrigConv =
-        ADC_ExternalTrigConv_Ext_IT11_TIM8_TRGO;   // ✅ TIM1 Update
-    ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
-    ADC_InitStructure.ADC_NbrOfChannel = ADC_CH_NUM;
-    ADC_Init(ADC1, &ADC_InitStructure);
-
-    /* 5. 通道顺序 */
-    ADC_RegularChannelConfig(
-        ADC1, ADC_Channel_0, 1, ADC_SampleTime_28Cycles5
-    );
-    ADC_RegularChannelConfig(
-        ADC1, ADC_Channel_1, 2, ADC_SampleTime_28Cycles5
-    );
-
-    /* 6. ADC → DMA */
-    ADC_DMACmd(ADC1, ENABLE);
-
-    /* 7. 外部触发使能 */
-    ADC_ExternalTrigConvCmd(ADC1, ENABLE);
-
-    /* 8. 启动 ADC */
-    ADC_Cmd(ADC1, ENABLE);
-
-    /* 9. 校准 */
-    ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1));
-
-    ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1));
-
-	ADC_ExternalTrigInjectedConvConfig(ADC1, ADC_ExternalTrigInjecConv_T1_TRGO);
-	/* Enable ADC1 injected external trigger conversion */
-	ADC_ExternalTrigInjectedConvCmd(ADC1, ENABLE);
+    int sign = (a < 0) ? -1 : 1;
+    int val  = (int)(a * sign * 100.0f + 0.5f);
+    printf("%c%d.%02d", (sign < 0) ? '-' : ' ', val / 100, val % 100);
 }
 
+/* ---- 软件延时 (~ms @72MHz, 粗略) ---- */
+static void delay_approx_ms(uint32_t ms)
+{
+    for (volatile uint32_t i = 0; i < ms * 7200; i++) __NOP();
+}
+
+/* ================================================================
+ * test_mt6701: 每秒打印编码器角度
+ *   输出: "[MT6701] raw=12345 angle=271.3 mg=8"
+ * ================================================================ */
+static void test_mt6701(void)
+{
+    mt6701_init();
+    printf("[MT6701] Test Start\r\n");
+
+    while (1) {
+        uint16_t raw   = mt6701_read_angle_raw();
+        float    angle = mt6701_read_angle_deg();
+        uint8_t  mg    = mt6701_read_status();
+
+        printf("[MT6701] raw=%5u  angle=", raw);
+        print_angle(angle);
+        printf("  mg=%d\r\n", mg);
+
+        delay_approx_ms(1000);
+    }
+}
+
+/* ================================================================
+ * test_ina199: 每秒打印 U/V 相电流
+ *   输出: "[INA199] U=2048(+0.00A) V=2048(+0.00A)"
+ * ================================================================ */
+static void test_ina199(void)
+{
+    ina199_init();
+    printf("[INA199] Test Start — 零电流≈2048\r\n");
+
+    while (1) {
+        uint16_t u_raw  = ina199_read_u_raw();
+        uint16_t v_raw  = ina199_read_v_raw();
+        float    u_amps = ina199_read_u_amps();
+        float    v_amps = ina199_read_v_amps();
+
+        printf("[INA199] U=%4u(", u_raw);
+        print_amps(u_amps);
+        printf(")  V=%4u(", v_raw);
+        print_amps(v_amps);
+        printf(")\r\n");
+
+        delay_approx_ms(1000);
+    }
+}
+
+/* ================================================================
+ * test_drv8313: U→V→W 依次 10% PWM 输出, 500ms/相
+ * ================================================================ */
+static void test_drv8313(void)
+{
+    drv8313_init();
+    drv8313_enable();
+    printf("[DRV8313] U→V→W 依次 10%% PWM, 500ms/相\r\n");
+
+    int ph = 0;
+    while (1) {
+        if      (ph == 0) { drv8313_set_phase(144, 0, 0); printf("[DRV8313] U ON\r\n");  }
+        else if (ph == 1) { drv8313_set_phase(0, 144, 0); printf("[DRV8313] V ON\r\n");  }
+        else              { drv8313_set_phase(0, 0, 144); printf("[DRV8313] W ON\r\n");  }
+        ph = (ph + 1) % 3;
+        delay_approx_ms(500);
+    }
+}
+
+/* ================================================================
+ * test_motor: 电机启动, 每秒打印: 角度/电流/占空比/换相间隔
+ * ================================================================ */
+static void test_motor(void)
+{
+    motor_init();
+    printf("[MOTOR] Init OK, starting...\r\n");
+    motor_start();
+
+    uint32_t loop = 0;
+    while (1) {
+        loop++;
+        if (loop % 720000 == 0) {   /* 约 1 秒 */
+            float    ang  = motor_read_angle();
+            float    iu   = motor_read_current_u();
+            float    iv   = motor_read_current_v();
+            uint16_t duty = motor_get_duty();
+
+            printf("[MOTOR] ang=");
+            print_angle(ang);
+            printf("  IU=");
+            print_amps(iu);
+            printf("  IV=");
+            print_amps(iv);
+            printf("  duty=%3u\r\n", duty);
+        }
+        __NOP();
+    }
+}
+
+/* ================================================================
+ * main
+ * ================================================================ */
 int main(void)
 {
-	pwm_init();
-	adc_init();
-	while(1);
-	return 0;
+    uart_init();
+    // printf("\r\n=== FOC Driver Test  %s %s ===\r\n\r\n",
+    //        __DATE__, __TIME__);
+
+    /* 取消注释切换测试 */
+    // test_motor();           /* 默认: 电机旋转 + 日志  */
+    // test_drv8313();      /* PWM 三相测试           */
+    test_mt6701();       /* 编码器测试             */
+    // test_ina199();       /* 电流采样测试           */
+
+    return 0;
 }

@@ -10,16 +10,30 @@ CPU = cortex-m3
 
 # 编译选项
 CFLAGS = -mcpu=$(CPU) -mthumb -nostartfiles -Wall -g -O0
-CFLAGS += -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER -Iinclude -Istartup -Icore -Idrivers/inc 
+CFLAGS += -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER
+CFLAGS += -Iinclude -Istartup -Icore -Idrivers/inc -Iapp
+CFLAGS += -Os
 LDFLAGS = -Tlinker.ld -Wl,-Map=output/$(TARGET).map
 LIBS = -lc -lm -lnosys
 
-# 源文件和目标文件
-SRCS = $(wildcard drivers/src/*.c) \
-		startup/system_stm32f10x.c \
-		startup/stm32f10x_it.c \
-		core/core_cm3.c	\
-		main.c
+# 源文件 (仅编译用到的外设驱动, 省 Flash)
+DRV_SRCS = drivers/src/misc.c \
+           drivers/src/stm32f10x_adc.c \
+           drivers/src/stm32f10x_dma.c \
+           drivers/src/stm32f10x_flash.c \
+           drivers/src/stm32f10x_gpio.c \
+           drivers/src/stm32f10x_rcc.c \
+           drivers/src/stm32f10x_tim.c \
+           drivers/src/stm32f10x_usart.c
+
+APP_SRCS = $(wildcard app/*.c)
+
+SRCS = $(DRV_SRCS) \
+       $(APP_SRCS) \
+       startup/system_stm32f10x.c \
+       startup/stm32f10x_it.c \
+       core/core_cm3.c \
+       main.c
 
 OBJS = $(SRCS:.c=.o)
 STARTUP = startup/startup_stm32f10x_md.s
@@ -35,7 +49,7 @@ all: $(ELF) $(BIN) $(HEX)
 
 # 生成 .elf 文件
 $(ELF): $(OBJS) $(STARTUP)
-	@mkdir $(OUTPUT)
+	@mkdir -p $(OUTPUT)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(SIZE) $@
 
@@ -57,13 +71,10 @@ $(STARTUP:.s=.o):
 
 # 清理
 clean:
-#	windows use
-#	del /f /q $(subst /,\,$(OBJS) $(ELF) $(BIN) $(HEX) $(OUTPUT)/$(TARGET).map)
-#	linux use
 	rm -f $(OBJS) $(STARTUP:.s=.o) $(ELF) $(BIN) $(HEX) $(OUTPUT)/$(TARGET).map
-	rmdir $(OUTPUT)
+	rm -rf $(OUTPUT) $(STARTUP:.s=.o)
 
-# 烧录到芯片
+# 烧录
 flash: $(BIN)
 	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg -c "program ./output/stm32f103c8t6.hex verify reset exit"
 
@@ -73,7 +84,6 @@ erase:
 readbin:
 	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg -c "init" -c "halt" -c "flash read_bank 0 read_flash.bin 0 0x10000" -c "exit"
 
-# 调试
 debug:
 	$(OPENOCD) -f interface/stlink.cfg -f target/stm32f1x.cfg
 

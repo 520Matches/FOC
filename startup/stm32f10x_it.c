@@ -131,9 +131,8 @@ void PendSV_Handler(void)
   * @param  None
   * @retval None
   */
-void SysTick_Handler(void)
-{
-}
+ /* SysTick_Handler 在 main.c 中实现 (换相定时) */
+ /* void SysTick_Handler(void) {} */
 
 /******************************************************************************/
 /*                 STM32F10x Peripherals Interrupt Handlers                   */
@@ -154,5 +153,4 @@ void SysTick_Handler(void)
 /**
   * @}
   */ 
-
 
