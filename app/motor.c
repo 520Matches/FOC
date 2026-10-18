@@ -1,162 +1,89 @@
 #include "motor.h"
-#include "drv8313.h"
-#include "mt6701.h"
-#include "ina199.h"
 
-/* ---- 三步换相模式: 每步仅一相 PWM, 另两相 GND ---- */
-static const uint8_t comm_pattern[3][3] = {
-    {1, 0, 0},  /* 步0: U→V+W  磁场 0°   */
-    {0, 1, 0},  /* 步1: V→U+W  磁场 120° */
-    {0, 0, 1},  /* 步2: W→U+V  磁场 240° */
-};
-
-/* ---- 加速斜坡参数 ---- */
-#define STEP_MS_START  100   /* 起步换相间隔 ms */
-#define STEP_MS_END     25   /* 目标换相间隔 ms */
-#define STEP_MS_DEC      3   /* 每档递减 ms     */
-#define RAMP_REVS         5   /* 每 N 电周期加速 */
-
-/* ---- 保护 ---- */
-#define OC_THRESHOLD_ADC  2800  /* 过流阈值 (≈1.2A @ ADC) */
-
-/* ---- 全局状态 ---- */
-static volatile uint32_t comm_tick   = 0;             /* SysTick 累加器       */
-static volatile uint32_t step_ms     = STEP_MS_START; /* 换相间隔 ms          */
-static volatile uint8_t  comm_step   = 0;             /* 当前步 0~2           */
-static volatile uint8_t  rev_count   = 0;             /* 电周期计数           */
-static volatile uint16_t motor_duty  = 80;            /* 当前占空比           */
-static volatile uint8_t  motor_on    = 0;             /* 0=停转, 1=运行      */
-
-/* ---- 内部函数 ---- */
-static void motor_commutate(uint8_t step);
-static void systick_init(void);
-
-/* ================================================================
- * motor_init: 一次性初始化全部外设
- *   drv8313(TIM1 PWM) + mt6701(SSI) + ina199(ADC+DMA) + SysTick
- * ================================================================ */
 void motor_init(void)
 {
-    drv8313_init();       /* TIM1 PWM 配置 (输出关闭) */
-    mt6701_init();        /* 编码器 SSI GPIO          */
-    ina199_init();        /* ADC + DMA 电流采样       */
-    systick_init();       /* 1ms 中断定时器           */
+    GPIO_InitTypeDef GPIO_InitStructure;
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+    TIM_OCInitTypeDef TIM_OCInitStructure;
+    TIM_BDTRInitTypeDef TIM_BDTRInitStructure;
+
+    // 1. 使能时钟
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_TIM1, ENABLE);
+
+    // 2. 配置 PA8(TIM1_CH1), PA9(TIM1_CH2), PA10(TIM1_CH3)
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8 | GPIO_Pin_9 | GPIO_Pin_10;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP; // 复用推挽输出
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    // 注意：FOC 还需要底管的互补输出（PB13, PB14, PB15），此处以 PA8/9/10 为主，互补通道会自动映射到 PB13/14/15
+    // 建议也把 PB13, PB14, PB15 配置为复用推挽输出
+    // RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    // GPIO_InitStructure.GPIO_Pin = GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
+    // GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    // 3. 配置 TIM1 时基单元 (中心对齐模式)
+    TIM_TimeBaseStructure.TIM_Prescaler = 0;                       // 不分频
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_CenterAligned1; // 中心对齐模式1
+    TIM_TimeBaseStructure.TIM_Period = FOC_PWM_PERIOD;             // ARR 值
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_RepetitionCounter = 0;               // 重复计数器，FOC 中通常设为0
+    TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
+
+    // 4. 配置 PWM 通道 (CH1, CH2, CH3)
+    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;              // PWM模式1
+    TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;  // 使能主输出
+    // TIM_OCInitStructure.TIM_OutputNState = TIM_OutputNState_Enable;// 使能互补输出
+    TIM_OCInitStructure.TIM_Pulse = 0;                             // 初始占空比为0
+    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;      // 主通道高电平有效
+    TIM_OCInitStructure.TIM_OCNPolarity = TIM_OCNPolarity_High;    // 互补通道高电平有效
+    TIM_OCInitStructure.TIM_OCIdleState = TIM_OCIdleState_Reset;   // 空闲状态主通道低电平
+    TIM_OCInitStructure.TIM_OCNIdleState = TIM_OCNIdleState_Reset;// 空闲状态互补通道低电平
+
+    TIM_OC1Init(TIM1, &TIM_OCInitStructure);
+    TIM_OC1PreloadConfig(TIM1, TIM_OCPreload_Enable);
+
+    TIM_OC2Init(TIM1, &TIM_OCInitStructure);
+    TIM_OC2PreloadConfig(TIM1, TIM_OCPreload_Enable);
+
+    TIM_OC3Init(TIM1, &TIM_OCInitStructure);
+    TIM_OC3PreloadConfig(TIM1, TIM_OCPreload_Enable);
+
+    // 5. 配置死区时间与刹车 (刹车功能视硬件需求，此处主要配置死区)
+    TIM_BDTRInitStructure.TIM_OSSRState = TIM_OSSRState_Enable;
+    TIM_BDTRInitStructure.TIM_OSSIState = TIM_OSSIState_Enable;
+    TIM_BDTRInitStructure.TIM_LOCKLevel = TIM_LOCKLevel_OFF;       // 不锁定
+    TIM_BDTRInitStructure.TIM_DeadTime = FOC_DEAD_TIME;            // 死区时间
+    TIM_BDTRInitStructure.TIM_Break = TIM_Break_Disable;           // 禁用刹车
+    TIM_BDTRInitStructure.TIM_BreakPolarity = TIM_BreakPolarity_High;
+    TIM_BDTRInitStructure.TIM_AutomaticOutput = TIM_AutomaticOutput_Enable;
+    TIM_BDTRConfig(TIM1, &TIM_BDTRInitStructure);
+
+    // 6. 使能预装载寄存器 (ARR, CCR)
+    TIM_ARRPreloadConfig(TIM1, ENABLE);
+
+    // 7. 启动 TIM1
+    TIM_Cmd(TIM1, ENABLE);
+
+    // 8. 关键步骤：使能主输出 (MOE)，否则互补[118;1:3u通道和主通道都不会有波形输出！
+    TIM_CtrlPWMOutputs(TIM1, ENABLE);
 }
 
-/* ================================================================
- * motor_start: 使能 PWM 输出, 从步0开始换相, 自动加速
- * ================================================================ */
-void motor_start(void)
+// 假设 duty 范围 0.0f ~ 1.0f，对应 0% ~ 100% 占空比
+void motor_set_duty(float duty_a, float duty_b, float duty_c)
 {
-    comm_tick  = 0;
-    step_ms    = STEP_MS_START;
-    comm_step  = 0;
-    rev_count  = 0;
-    motor_on   = 1;
+    // 限制占空比范围，防止 100% 或 0% 导致的自举电容无法充电等问题
+    if(duty_a > 0.95f) duty_a = 0.95f;
+    if(duty_a < 0.05f) duty_a = 0.05f;
+    if(duty_b > 0.95f) duty_b = 0.95f;
+    if(duty_b < 0.05f) duty_b = 0.05f;
+    if(duty_c > 0.95f) duty_c = 0.95f;
+    if(duty_c < 0.05f) duty_c = 0.05f;
+    // 同理限制 duty_b, duty_c...
 
-    drv8313_enable();           /* MOE=1, PWM 输出使能 */
-    motor_commutate(0);         /* 首次换相 (步0)      */
-}
-
-/* ================================================================
- * motor_stop: 关 PWM 输出, 停止换相
- * ================================================================ */
-void motor_stop(void)
-{
-    motor_on = 0;
-    drv8313_disable();          /* MOE=0, 全部关断 */
-    drv8313_set_phase(0, 0, 0);
-}
-
-/* ================================================================
- * motor_commutate: 按 comm_pattern 设置三相 CCR
- *   导通相 = motor_duty, 关断相 = 0 (GND)
- * ================================================================ */
-static void motor_commutate(uint8_t step)
-{
-    uint16_t d = motor_duty;  /* 快照, 防止中断修改 */
-
-    drv8313_set_phase(
-        comm_pattern[step][0] ? d : 0,  /* U */
-        comm_pattern[step][1] ? d : 0,  /* V */
-        comm_pattern[step][2] ? d : 0   /* W */
-    );
-}
-
-/* ================================================================
- * systick_init: SysTick 1ms
- * ================================================================ */
-static void systick_init(void)
-{
-    if (SysTick_Config(SystemCoreClock / 1000)) {
-        while (1);      /* 配置失败: 死循环, 方便调试 */
-    }
-}
-
-/* ================================================================
- * SysTick_Handler: 1ms 中断 — 换相定时 + 加速斜坡 + 过流保护
- * ================================================================ */
-void SysTick_Handler(void)
-{
-    if (!motor_on) return;
-
-    comm_tick++;
-
-    /* 过流保护: 任一相超过阈值则立即停机 */
-    if (ina199_read_u_raw() > OC_THRESHOLD_ADC ||
-        ina199_read_v_raw() > OC_THRESHOLD_ADC) {
-        motor_stop();
-        return;
-    }
-
-    /* 换相定时 */
-    if (comm_tick >= step_ms) {
-        comm_tick = 0;
-        comm_step++;
-        if (comm_step >= 3) {
-            comm_step = 0;                  /* 3步 = 1 电周期       */
-            rev_count++;
-
-            /* 加速斜坡 */
-            if (rev_count >= RAMP_REVS) {
-                rev_count = 0;
-                if (step_ms > STEP_MS_END + STEP_MS_DEC) {
-                    step_ms -= STEP_MS_DEC;
-                }
-            }
-        }
-        motor_commutate(comm_step);
-    }
-}
-
-/* ================================================================
- * motor_set_duty / motor_get_duty: 运行时调整占空比
- * ================================================================ */
-void motor_set_duty(uint16_t duty)
-{
-    if (duty > PWM_MAX) duty = PWM_MAX;
-    motor_duty = duty;
-}
-
-uint16_t motor_get_duty(void)
-{
-    return motor_duty;
-}
-
-/* ================================================================
- * 传感器接口: 封装 MT6701 / INA199 驱动
- * ================================================================ */
-float motor_read_angle(void)
-{
-    return mt6701_read_angle_deg();
-}
-
-float motor_read_current_u(void)
-{
-    return ina199_read_u_amps();
-}
-
-float motor_read_current_v(void)
-{
-    return ina199_read_v_amps();
+    // 中心对齐模式下，CCR 值直接对应占空比
+    // 公式：CCR = duty * ARR
+    TIM1->CCR1 = (uint16_t)(duty_a * FOC_PWM_PERIOD);
+    TIM1->CCR2 = (uint16_t)(duty_b * FOC_PWM_PERIOD);
+    TIM1->CCR3 = (uint16_t)(duty_c * FOC_PWM_PERIOD);
 }
